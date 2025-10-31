@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple, Set
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 env_path = Path(__file__).parent.parent.parent / '.env'
 load_dotenv(env_path)
 
@@ -15,7 +14,7 @@ from models.ContractAnalysisResponseModel import ContractAnalysisResponse, Claus
 from models.ComplianceRiskScore import ComplianceRiskScore
 from utils.law_loader import LawLoader
 from service.RegulatoryEngineService import RegulatoryEngineService
-from utils.ai_client import WatsonXClient, WatsonXConfig
+from utils.ai_client import WatsonXClient, WatsonXConfig, GeminiClient, GeminiConfig
 from utils.ai_client.exceptions import ConfigurationError, APIError, AuthenticationError 
 
 logger = logging.getLogger(__name__)
@@ -25,18 +24,39 @@ class ContractAnalyzerService:
         self.law_loader = LawLoader()
         self.regulatory_engine = RegulatoryEngineService(self.law_loader)
         self.watsonx_client = None
+        self.gemini_client = None
+        self.ai_provider = None  # Track which provider is active
         
-        # Initialize our custom WatsonX AI client
+        # Try to initialize Gemini client first (preferred)
         try:
-            config = WatsonXConfig.from_environment()
-            self.watsonx_client = WatsonXClient(config)
-            logger.info("Custom WatsonX AI client initialized successfully.")
+            gemini_config = GeminiConfig.from_environment()
+            self.gemini_client = GeminiClient(gemini_config)
+            self.ai_provider = "gemini"
+            logger.info(f"Gemini AI client initialized successfully with model: {gemini_config.model_name}")
         except ConfigurationError as e:
-            logger.warning(f"Failed to initialize WatsonX client due to configuration: {e}")
-            self.watsonx_client = None
+            logger.info(f"Gemini client not configured: {e}")
         except Exception as e:
-            logger.error(f"Failed to initialize WatsonX client: {e}")
-            self.watsonx_client = None
+            logger.warning(f"Failed to initialize Gemini client: {e}")
+        
+        # Fall back to IBM WatsonX if Gemini is not available
+        if not self.gemini_client:
+            try:
+                config = WatsonXConfig.from_environment()
+                self.watsonx_client = WatsonXClient(config)
+                self.ai_provider = "watsonx"
+                logger.info("IBM WatsonX Granite client initialized successfully.")
+            except ConfigurationError as e:
+                logger.warning(f"Failed to initialize WatsonX client due to configuration: {e}")
+                self.watsonx_client = None
+            except Exception as e:
+                logger.error(f"Failed to initialize WatsonX client: {e}")
+                self.watsonx_client = None
+        
+        # Log the active AI provider
+        if self.ai_provider:
+            logger.info(f"Active AI Provider: {self.ai_provider.upper()}")
+        else:
+            logger.warning("No AI provider available - will use fallback analysis")
                 
     async def analyze_contract(self, request: ContractAnalysisRequest) -> ContractAnalysisResponse:
         """
@@ -58,41 +78,45 @@ class ContractAnalyzerService:
                 contract_type=contract_metadata['type']
             )
 
-            # 4. Use IBM WatsonX AI with enhanced prompting
-            api_key = os.getenv("IBM_API_KEY")
-            project_id = os.getenv("WATSONX_PROJECT_ID")
-            use_real_ai = (self.watsonx_client is not None and api_key and project_id)
-
-            if use_real_ai:
+            # 4. Determine which AI service to use
+            use_ai = self.ai_provider is not None
+            
+            if use_ai:
                 try:
-                    logger.info("Making request to IBM WatsonX AI with Granite model for legal analysis")
-                    # Use enhanced prompting with contract metadata
-                    ai_response_text = self._get_granite_analysis_with_context(
-                        cleaned_contract, contract_metadata, compliance_checklist, jurisdiction
-                    )
-                    logger.info(f"IBM Granite AI Response received: {ai_response_text[:200]}...")
+                    if self.ai_provider == "gemini":
+                        logger.info("Using Google Gemini AI for contract analysis")
+                        ai_response_text = self._get_gemini_analysis(
+                            cleaned_contract, contract_metadata, compliance_checklist, jurisdiction
+                        )
+                        logger.info(f"Gemini AI Response received: {ai_response_text[:200]}...")
+                    else:  # watsonx
+                        logger.info("Using IBM WatsonX Granite AI for contract analysis")
+                        ai_response_text = self._get_granite_analysis_with_context(
+                            cleaned_contract, contract_metadata, compliance_checklist, jurisdiction
+                        )
+                        logger.info(f"IBM Granite AI Response received: {ai_response_text[:200]}...")
                     
                     # Validate the AI response
-                    if self._is_granite_response_minimal(ai_response_text):
-                        logger.info("IBM Granite response appears minimal, enhancing with domain expertise")
+                    if self._is_ai_response_minimal(ai_response_text):
+                        logger.info(f"{self.ai_provider.upper()} response appears minimal, enhancing with domain expertise")
                         ai_response_text = self._get_intelligent_mock_analysis(
                             cleaned_contract, contract_metadata, compliance_checklist, jurisdiction
                         )
                     else:
-                        logger.info("IBM Granite provided comprehensive analysis - using AI response directly")
+                        logger.info(f"{self.ai_provider.upper()} provided comprehensive analysis - using AI response directly")
                         
                 except (APIError, AuthenticationError) as e:
-                    logger.error(f"WatsonX API error: {e}")
+                    logger.error(f"{self.ai_provider.upper()} API error: {e}")
                     ai_response_text = self._get_intelligent_mock_analysis(
                         cleaned_contract, contract_metadata, compliance_checklist, jurisdiction
                     )
                 except Exception as e:
-                    logger.error(f"Unexpected error calling IBM WatsonX: {e}")
+                    logger.error(f"Unexpected error calling {self.ai_provider.upper()}: {e}")
                     ai_response_text = self._get_intelligent_mock_analysis(
                         cleaned_contract, contract_metadata, compliance_checklist, jurisdiction
                     )
             else:
-                logger.warning("IBM WatsonX client not properly configured - using intelligent mock for demo")
+                logger.warning("No AI provider available - using intelligent fallback analysis")
                 ai_response_text = self._get_intelligent_mock_analysis(
                     cleaned_contract, contract_metadata, compliance_checklist, jurisdiction
                 )
@@ -372,6 +396,44 @@ class ContractAnalyzerService:
             return self._get_intelligent_mock_analysis(contract_text, metadata, compliance_checklist, jurisdiction)
         except Exception as e:
             logger.error(f"Unexpected error with IBM Granite: {e}")
+            return self._get_intelligent_mock_analysis(contract_text, metadata, compliance_checklist, jurisdiction)
+    
+    def _get_gemini_analysis(self, contract_text: str, metadata: Dict[str, Any], 
+                            compliance_checklist: Dict[str, Any], jurisdiction: str) -> str:
+        """
+        Enhanced analysis using Google Gemini AI with contract context and intelligent prompting.
+        """
+        if not self.gemini_client:
+            logger.warning("Gemini client not available, falling back to intelligent analysis")
+            return self._get_intelligent_mock_analysis(contract_text, metadata, compliance_checklist, jurisdiction)
+        
+        try:
+            logger.info("Engaging Google Gemini model for advanced legal analysis")
+            
+            # Use the Gemini client's analyze_contract method
+            gemini_response = self.gemini_client.analyze_contract(
+                contract_text=contract_text,
+                compliance_checklist=compliance_checklist
+            )
+            
+            logger.info(f"Gemini analysis completed successfully: {len(gemini_response)} characters")
+            
+            # Validate Gemini response quality
+            if self._is_ai_response_minimal(gemini_response):
+                logger.info("Gemini response needs enhancement, combining with domain expertise")
+                # Enhance minimal response with our intelligent analysis
+                enhanced_response = self._enhance_ai_response(
+                    gemini_response, contract_text, metadata, jurisdiction
+                )
+                return enhanced_response
+            
+            return gemini_response
+            
+        except (APIError, AuthenticationError) as e:
+            logger.error(f"Gemini API error: {e}")
+            return self._get_intelligent_mock_analysis(contract_text, metadata, compliance_checklist, jurisdiction)
+        except Exception as e:
+            logger.error(f"Unexpected error with Gemini: {e}")
             return self._get_intelligent_mock_analysis(contract_text, metadata, compliance_checklist, jurisdiction)
     
     def _build_enhanced_granite_prompt(self, contract_text: str, metadata: Dict[str, Any], jurisdiction: str) -> str:
@@ -1277,9 +1339,10 @@ OUTPUT FORMAT: Valid JSON with summary, flagged_clauses, and compliance_issues a
         
         return content_focus
 
-    def _is_granite_response_minimal(self, response_text: str) -> bool:
+    def _is_ai_response_minimal(self, response_text: str) -> bool:
         """
         Enhanced detection of minimal AI responses that need augmentation.
+        Works for both Gemini and IBM Granite responses.
         """
         try:
             response_json = json.loads(response_text)
@@ -1301,6 +1364,11 @@ OUTPUT FORMAT: Valid JSON with summary, flagged_clauses, and compliance_issues a
         except json.JSONDecodeError:
             logger.warning("Could not parse AI response as JSON - treating as minimal")
             return True
+    
+    # Keep the old method name for backward compatibility
+    def _is_granite_response_minimal(self, response_text: str) -> bool:
+        """Backward compatibility wrapper for _is_ai_response_minimal"""
+        return self._is_ai_response_minimal(response_text)
     
     def _clean_ai_response(self, ai_json: Dict[str, Any], jurisdiction: str, contract_text: str) -> Dict[str, Any]:
         """
@@ -2336,19 +2404,19 @@ OUTPUT FORMAT: Valid JSON with summary, flagged_clauses, and compliance_issues a
         logger.info(f"Critical legal analysis: {len(critical_clauses)}/{len(flagged_clauses)} clauses passed priority filter")
         return critical_clauses
     
-    def _enhance_granite_response(self, granite_response: str, contract_text: str, 
-                                 metadata: Dict[str, Any], jurisdiction: str) -> str:
+    def _enhance_ai_response(self, ai_response: str, contract_text: str, 
+                           metadata: Dict[str, Any], jurisdiction: str) -> str:
         """
-        Enhance a minimal Granite response by combining it with domain expertise.
+        Enhance a minimal AI response (Gemini or Granite) by combining it with domain expertise.
         """
         try:
-            # Parse existing Granite response
-            granite_json = json.loads(granite_response)
+            # Parse existing AI response
+            ai_json = json.loads(ai_response)
         except json.JSONDecodeError:
-            logger.warning("Could not parse Granite response, creating new analysis")
-            granite_json = {"summary": "", "flagged_clauses": [], "compliance_issues": []}
+            logger.warning(f"Could not parse {self.ai_provider} response, creating new analysis")
+            ai_json = {"summary": "", "flagged_clauses": [], "compliance_issues": []}
         
-        # Get our intelligent analysis to supplement Granite
+        # Get our intelligent analysis to supplement AI
         intelligent_analysis = self._get_intelligent_mock_analysis(
             contract_text, metadata, {}, jurisdiction
         )
@@ -2357,13 +2425,13 @@ OUTPUT FORMAT: Valid JSON with summary, flagged_clauses, and compliance_issues a
             intelligent_json = json.loads(intelligent_analysis)
         except json.JSONDecodeError:
             logger.error("Could not parse intelligent analysis")
-            return granite_response
+            return ai_response
         
-        # Merge the analyses - prefer Granite's results but supplement with ours
-        merged_flagged = list(granite_json.get("flagged_clauses", []))
-        merged_compliance = list(granite_json.get("compliance_issues", []))
+        # Merge the analyses - prefer AI's results but supplement with ours
+        merged_flagged = list(ai_json.get("flagged_clauses", []))
+        merged_compliance = list(ai_json.get("compliance_issues", []))
         
-        # Add our flagged clauses if Granite didn't find enough
+        # Add our flagged clauses if AI didn't find enough
         if len(merged_flagged) < 3:
             for clause in intelligent_json.get("flagged_clauses", []):
                 # Avoid duplicates
@@ -2373,7 +2441,7 @@ OUTPUT FORMAT: Valid JSON with summary, flagged_clauses, and compliance_issues a
                     if len(merged_flagged) >= 5:  # Limit total flagged clauses
                         break
         
-        # Add our compliance issues if Granite didn't find enough
+        # Add our compliance issues if AI didn't find enough
         if len(merged_compliance) < 2:
             for issue in intelligent_json.get("compliance_issues", []):
                 # Avoid duplicates by law type
@@ -2383,7 +2451,7 @@ OUTPUT FORMAT: Valid JSON with summary, flagged_clauses, and compliance_issues a
         
         # Create enhanced summary
         enhanced_summary = self._create_enhanced_summary(
-            granite_json.get("summary", ""), intelligent_json.get("summary", ""),
+            ai_json.get("summary", ""), intelligent_json.get("summary", ""),
             len(merged_flagged), len(merged_compliance), metadata, jurisdiction
         )
         
@@ -2393,8 +2461,14 @@ OUTPUT FORMAT: Valid JSON with summary, flagged_clauses, and compliance_issues a
             "compliance_issues": merged_compliance[:5]  # Limit to top 5
         }
         
-        logger.info(f"Enhanced Granite response: {len(merged_flagged)} flagged clauses, {len(merged_compliance)} compliance issues")
+        logger.info(f"Enhanced {self.ai_provider} response: {len(merged_flagged)} flagged clauses, {len(merged_compliance)} compliance issues")
         return json.dumps(enhanced_response)
+    
+    # Keep the old method name for backward compatibility
+    def _enhance_granite_response(self, granite_response: str, contract_text: str, 
+                                 metadata: Dict[str, Any], jurisdiction: str) -> str:
+        """Backward compatibility wrapper for _enhance_ai_response"""
+        return self._enhance_ai_response(granite_response, contract_text, metadata, jurisdiction)
     
     def _create_enhanced_summary(self, granite_summary: str, intelligent_summary: str,
                                 flagged_count: int, compliance_count: int,
