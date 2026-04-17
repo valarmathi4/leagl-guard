@@ -9,6 +9,10 @@ jobs:
   backend:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: backend
+
     steps:
       - uses: actions/checkout@v3
 
@@ -17,13 +21,17 @@ jobs:
         with:
           python-version: 3.10
 
-      - name: Install Backend Dependencies
+      - name: Install Dependencies
         run: |
-          cd backend
+          pip install --upgrade pip
           pip install -r requirements.txt
 
   frontend:
     runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
 
     steps:
       - uses: actions/checkout@v3
@@ -33,7 +41,8 @@ jobs:
         with:
           node-version: 18
 
-      - name: Install Frontend
-        run: |
-          cd frontend
-          npm install
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Build Frontend
+        run: npm run build
